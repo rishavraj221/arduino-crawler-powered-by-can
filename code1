@@ -1,0 +1,19 @@
+void task_txCAN(void * pvParameters) {
+ for(;;) {
+   CAN_frame_t tx_frame;
+   int d = distance;
+   tx_frame.FIR.B.FF==CAN_frame_std;
+   tx_frame.MsgID = 0x20;
+   tx_frame.FIR.B.DLC = 8;
+   tx_frame.data.u8[0] = byte(auto_break);
+   tx_frame.data.u8[1] = byte(break_active);
+   tx_frame.data.u8[2] = byte(tilt_warn);
+   tx_frame.data.u8[3] = 0;
+   tx_frame.data.u8[4] = byte(d>>(3*8));
+   tx_frame.data.u8[5] = byte(d<<(1*8)>>(3*8));
+   tx_frame.data.u8[6] = byte(d<<(2*8)>>(3*8));
+   tx_frame.data.u8[7] = byte(d<<(3*8)>>(3*8));
+   ESP32Can.CANWriteFrame(&tx_frame);
+   delay(50);
+ }
+} 
