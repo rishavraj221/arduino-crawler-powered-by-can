@@ -1,0 +1,367 @@
+// << ESP32 Crawler >>
+// board is "ESP32 Dev Module"
+
+#include <WiFi.h> // used to turn WiFi off
+
+#define LED_PIN 2
+
+#include <Wire.h>
+
+#include <Adafruit_MotorShield.h>
+
+Adafruit_MotorShield AFMS = Adafruit_MotorShield();
+
+Adafruit_DCMotor *right_motor = AFMS.getMotor(3);
+Adafruit_DCMotor *left_motor = AFMS.getMotor(4);
+
+#define SPEED_MIN 70 // motor min
+#define SPEED_MAX 255 // max speed
+#define SPEED_NONE 0
+int constSpeeds[] = {100, 150, 200, 250};
+int speedIndex = 1;
+bool incState = false;
+bool incLast = false;
+bool decState = false;
+bool decLast = false;
+
+#include <VL53L0X.h>
+VL53L0X sensor;
+
+#define DISTANCE_MIN 150
+int distance = 0;
+bool auto_break  = true;
+bool break_active = false;
+
+#include "MPU9250.h"
+MPU9250 IMU(Wire, 0x68);
+int status;
+#define TILT_MAX 45
+bool tilt_warn = false;
+
+#include <ESP32CAN.h>
+#define CAN_SPEED CAN_SPEED_250KBPS
+#define CAN_TX GPIO_NUM_16
+#define CAN_RX GPIO_NUM_17
+#include <CAN_config.h>
+
+CAN_device_t CAN_cfg;
+const int rx_queue_size = 10;
+
+#define STICK_CAN_TIMEOUT 250
+unsigned long lastStickReveiced;
+
+int stick_left_x = 0;
+int stick_left_y = 0;
+int stick_right_x = 0;
+int stick_right_y = 0;
+
+bool button_left = false;
+bool button_right = false;
+bool button_up = false;
+bool button_down = false;
+
+bool button_square = false;
+bool button_circle = false;
+bool button_triangle = false;
+bool button_cross = false;
+
+bool button_l1 = false;
+bool button_r1 = false;
+
+void task_rxCAN(void * pvParameters) {
+  for(;;) {
+    CAN_frame_t rx_frame;
+
+    if(xQueueReceive(CAN_cfg.rx_queue,&rx_frame, 3*portTICK_PERIOD_MS)==pdTRUE){
+      if(rx_frame.FIR.B.FF==CAN_frame_std) { // standard frame format
+        digitalWrite(LED_PIN, HIGH);
+        // start of message evaluation
+        if (rx_frame.MsgID == 0x10 && rx_frame.FIR.B.DLC == 8) {
+          if (rx_frame.data.u8[1]) {
+            stick_right_x = int(rx_frame.data.u8[0]);
+          }
+          else {
+            stick_right_x = int(-(rx_frame.data.u8[0] - 1));
+          }
+          if (rx_frame.data.u8[3]) {
+            stick_right_y = int(rx_frame.data.u8[2]);
+          }
+          else {
+            stick_right_y = int(-(rx_frame.data.u8[2] - 1));
+          }
+          if (rx_frame.data.u8[5]) {
+            stick_left_x = int(rx_frame.data.u8[4]);
+          }
+          else {
+            stick_left_x = int(-(rx_frame.data.u8[4] - 1));
+          }
+          if (rx_frame.data.u8[7]) {
+            stick_left_y = int(rx_frame.data.u8[6]);
+          }
+          else {
+            stick_left_y = int(-(rx_frame.data.u8[6] - 1));
+          }
+          lastStickReveiced = millis();
+        }
+        else if (rx_frame.MsgID == 0x11 && rx_frame.FIR.B.DLC == 8) {
+          button_right = (bool)rx_frame.data.u8[0];
+          button_left = (bool)rx_frame.data.u8[1];
+          button_up = (bool)rx_frame.data.u8[2];
+          button_down = (bool)rx_frame.data.u8[3];
+          button_square = (bool)rx_frame.data.u8[4];
+          button_circle = (bool)rx_frame.data.u8[5];
+          button_triangle = (bool)rx_frame.data.u8[6];
+          button_cross = (bool)rx_frame.data.u8[7];
+        }
+        else if (rx_frame.MsgID == 0x12 && rx_frame.FIR.B.DLC == 8) {
+          button_l1 = (bool)rx_frame.data.u8[0];
+          button_r1 = (bool)rx_frame.data.u8[1];
+        }
+        // end of message evaluation
+      }
+    }
+    else {
+      digitalWrite(LED_PIN, LOW);
+    }
+  }
+}
+
+void task_txCAN(void * pvParameters) {
+  for(;;) {
+    CAN_frame_t tx_frame;
+    int d = distance;
+    
+    tx_frame.FIR.B.FF==CAN_frame_std;
+    tx_frame.MsgID = 0x20;
+    tx_frame.FIR.B.DLC = 8;
+    tx_frame.data.u8[0] = byte(auto_break);
+    tx_frame.data.u8[1] = byte(break_active);
+    tx_frame.data.u8[2] = byte(tilt_warn);
+    tx_frame.data.u8[3] = 0;
+    tx_frame.data.u8[4] = byte(d>>(3*8));
+    tx_frame.data.u8[5] = byte(d<<(1*8)>>(3*8));
+    tx_frame.data.u8[6] = byte(d<<(2*8)>>(3*8));
+    tx_frame.data.u8[7] = byte(d<<(3*8)>>(3*8));
+    
+    ESP32Can.CANWriteFrame(&tx_frame);
+    
+    delay(50);
+  }
+}
+
+void setup() 
+{
+//  Serial.begin(57600);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  WiFi.mode(WIFI_OFF);
+  btStop();
+
+  AFMS.begin();
+
+  right_motor->setSpeed(SPEED_NONE);
+  right_motor->run(RELEASE);
+
+  left_motor->setSpeed(SPEED_NONE);
+  left_motor->run(RELEASE);
+  
+  sensor.setTimeout(500);
+  if (!sensor.init())
+  {
+    // failed to detect and initialize sensor!
+    while (1) {}
+  }
+
+  // start communication with IMU
+  status = IMU.begin();
+  if (status < 0) {
+    // failed to detect and initialize sensor!
+    while (1) {}
+  }
+  
+  digitalWrite(LED_PIN, HIGH);
+  delay(200);
+  digitalWrite(LED_PIN, LOW);
+
+  CAN_cfg.speed=CAN_SPEED;
+  CAN_cfg.tx_pin_id = CAN_TX;
+  CAN_cfg.rx_pin_id = CAN_RX;
+  CAN_cfg.rx_queue = xQueueCreate(rx_queue_size, sizeof(CAN_frame_t));
+  
+  ESP32Can.CANInit();
+
+  // Task: read CAN
+  xTaskCreatePinnedToCore(
+    task_rxCAN,     /* Function to implement the task */
+    "task_rxCAN",   /* Name of the task */
+    4096,      /* Stack size in words */
+    NULL,      /* Task input parameter */
+    1,         /* Priority of the task */
+    NULL,      /* Task handle. */
+    1);        /* Core where the task should run */
+
+  lastStickReveiced = millis();
+
+  // Task: write CAN
+  xTaskCreatePinnedToCore(
+    task_txCAN,     /* Function to implement the task */
+    "task_txCAN",   /* Name of the task */
+    4096,      /* Stack size in words */
+    NULL,      /* Task input parameter */
+    1,         /* Priority of the task */
+    NULL,      /* Task handle. */
+    1);        /* Core where the task should run */
+}
+
+void loop() 
+{ 
+//  Serial.print("R_X: "); Serial.print(stick_right_x, DEC);
+//  Serial.print(" R_Y: "); Serial.print(stick_right_y, DEC);
+//  Serial.print(" L_X: "); Serial.print(stick_left_x, DEC);
+//  Serial.print(" L_Y: "); Serial.print(stick_left_y, DEC);
+//  Serial.println();
+
+  float acX, acY, acZ;
+  float p, r;
+  int pitch = 0, roll = 0;
+  
+  IMU.readSensor();
+  acX = IMU.getAccelX_mss();
+  acY = IMU.getAccelY_mss();
+  acZ = IMU.getAccelZ_mss();
+  p = atan(acX / sqrt((acY * acY) + (acZ * acZ)));
+  r = atan(acY / sqrt((acX * acX) + (acZ * acZ)));
+  //convert radians into degrees
+  pitch = int(p * 57.2958); // 180.0 / pi
+  roll = int(r * 57.2958); // 180.0 / pi
+//  Serial.print("IMUP: "); Serial.print(pitch);
+//  Serial.print(" IMUR: "); Serial.print(roll);
+//  Serial.println();
+  tilt_warn = max(abs(pitch), abs(roll)) > TILT_MAX;
+
+  delay(5);
+
+  distance = sensor.readRangeSingleMillimeters();
+  if (sensor.timeoutOccurred()) distance = 0;
+//  Serial.print("DIS: "); Serial.print(distance); Serial.print(" ");
+//  Serial.println();
+
+  delay(5);
+
+  if ((millis() - lastStickReveiced) < STICK_CAN_TIMEOUT) {
+
+    int throttle = stick_left_y; // -128 0 127
+    int steering = stick_right_x; // -128 0 127
+    int left_speed = 0, right_speed = 0;
+
+    if (throttle > 0) throttle +=1; // max out to 128
+    if (steering > 0) steering +=1; // max out to 128
+
+    if (button_triangle) {
+      auto_break = true;
+//      Serial.println("Auto break on.");
+    }
+    else if (button_cross) {
+      auto_break = false;
+//      Serial.println("Auto break off.");
+    }
+
+    // mix throttle and steering inputs to obtain left & right motor speeds
+    left_speed = ((throttle * SPEED_MAX / 128) + (steering * SPEED_MAX / 128));
+    right_speed = ((throttle * SPEED_MAX / 128) - (steering * SPEED_MAX / 128));
+    
+    // cap speeds to max
+    left_speed = min(max(left_speed, -SPEED_MAX), SPEED_MAX);
+    right_speed = min(max(right_speed, -SPEED_MAX), SPEED_MAX);
+
+    // decrease/increase fixed speed for digital pad control)
+    decState = button_l1;
+    if(decState && decState != decLast) {
+      if (speedIndex > 0) speedIndex--;
+    }
+    decLast = decState;
+    incState = button_r1;
+    if(incState && incState != incLast) {
+      if (speedIndex < 3) speedIndex++;
+    }
+    incLast = incState;
+
+    // overwrite analog input by digital in case active
+    if (button_right){
+      left_speed = constSpeeds[speedIndex];
+      right_speed = -constSpeeds[speedIndex];
+    }
+    else if (button_left){
+      left_speed = -constSpeeds[speedIndex];
+      right_speed = constSpeeds[speedIndex];    
+    }
+    else if (button_up) {
+      left_speed = constSpeeds[speedIndex];
+      right_speed = constSpeeds[speedIndex];
+    }
+    else if (button_down){
+      left_speed = -constSpeeds[speedIndex];
+      right_speed = -constSpeeds[speedIndex];    
+    }
+  
+    if (abs(left_speed) < SPEED_MIN) left_speed = 0;
+    if (abs(right_speed) < SPEED_MIN) right_speed = 0;
+
+    if (auto_break) {
+      break_active = false;
+      if (distance < (DISTANCE_MIN * 1.5) && left_speed > (SPEED_MAX / 2) && right_speed > (SPEED_MAX / 2)) {
+        left_speed = left_speed / 2;
+        right_speed = right_speed / 2;        
+      }
+      if (distance < DISTANCE_MIN && left_speed > 0 && right_speed > 0) {
+        left_speed = SPEED_NONE;
+        right_speed = SPEED_NONE;
+        break_active = true;
+      }
+    }
+
+//    Serial.print("RSDP: "); Serial.print(right_speed);
+//    Serial.print(" LSPD: "); Serial.print(left_speed);
+//    Serial.println();
+
+    right_motor->setSpeed(abs(right_speed));
+    if (right_speed >= 0) right_motor->run(FORWARD);
+    else right_motor->run(BACKWARD);
+    
+    left_motor->setSpeed(abs(left_speed));
+    if (left_speed >= 0) left_motor->run(FORWARD);
+    else left_motor->run(BACKWARD);
+
+    delay(5);
+  }
+  else {
+    stick_left_x = 0;
+    stick_left_y = 0;
+    stick_right_x = 0;
+    stick_right_y = 0;
+
+    button_left = false;
+    button_right = false;
+    button_up = false;
+    button_down = false;
+
+    button_square = false;
+    button_circle = false;
+    button_triangle = false;
+    button_cross = false;
+
+    button_l1 = false;
+    button_r1 = false;
+    
+//    Serial.println("TIMEOUT: Stick Frame not received");
+    
+    right_motor->setSpeed(SPEED_NONE);
+    right_motor->run(RELEASE);
+
+    left_motor->setSpeed(SPEED_NONE);
+    left_motor->run(RELEASE);
+
+    delay(STICK_CAN_TIMEOUT);
+  }
+}
