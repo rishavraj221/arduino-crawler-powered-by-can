@@ -1,0 +1,282 @@
+// << ESP32 Crawler >>
+// board is "D-duino-32"
+// in case the controller is no longer pairing but was working before,
+// run "esptool --chip esp32 erase_flash" in C:\Users\<user>\AppData\Local\Arduino15\packages\esp32\tools\esptool_py\2.6.1
+
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h> // works only if board and variant config for D-duino-32 is available
+
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+
+#define OLED_RESET 3
+#define OLED_ROTATION 0
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+#if (SSD1306_LCDHEIGHT != 64)
+#error("Height incorrect, please fix Adafruit_SSD1306.h!");
+#endif
+
+#include <PS4Controller.h>
+#define PS4_HOST_MAC "00:1e:ab:4c:4e:c8"
+#define TILT_RUMBLE 127
+
+#include <ESP32CAN.h>
+#define CAN_SPEED CAN_SPEED_250KBPS
+#define CAN_TX GPIO_NUM_15
+#define CAN_RX GPIO_NUM_13
+#include <CAN_config.h>
+
+CAN_device_t CAN_cfg;
+const int rx_queue_size = 10;
+
+#define STATUS_CAN_TIMEOUT 250
+unsigned long lastStatusReveiced;
+
+bool auto_break = false;
+bool break_active = false;
+int distance = 0;
+byte tilt_warn = false;
+
+void task_rxCAN(void * pvParameters) {
+  for(;;) {
+    CAN_frame_t rx_frame;
+
+    if(xQueueReceive(CAN_cfg.rx_queue,&rx_frame, 3*portTICK_PERIOD_MS)==pdTRUE){
+      // start of message evaluation
+      if(rx_frame.FIR.B.FF==CAN_frame_std) { // standard frame format
+        if (rx_frame.MsgID == 0x20 && rx_frame.FIR.B.DLC == 8) {
+          auto_break =   bool(rx_frame.data.u8[0]);
+          break_active = bool(rx_frame.data.u8[1]);
+          tilt_warn =    bool(rx_frame.data.u8[2]);
+          distance  =     int(rx_frame.data.u8[4])<<(3*8);
+          distance +=     int(rx_frame.data.u8[5])<<(2*8);
+          distance +=     int(rx_frame.data.u8[6])<<(1*8);
+          distance +=     int(rx_frame.data.u8[7]);
+          
+          lastStatusReveiced = millis();
+        }
+      }
+      // end of message evaluation
+    } 
+  }
+}
+
+void setup() 
+{
+//  Serial.begin(57600);
+
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3c)) { // Address 0x3D for 128x64
+//    Serial.println(F("SSD1306 allocation failed"));
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE, BLACK);
+  display.setCursor(5,5);
+  display.print("<< ESP32 CRAWLER >>");
+  display.display();
+  
+  PS4.begin(PS4_HOST_MAC);
+
+  CAN_cfg.speed=CAN_SPEED;
+  CAN_cfg.tx_pin_id = CAN_TX;
+  CAN_cfg.rx_pin_id = CAN_RX;
+  CAN_cfg.rx_queue = xQueueCreate(rx_queue_size, sizeof(CAN_frame_t));
+  
+  ESP32Can.CANInit();
+
+  // Task: read CAN
+  xTaskCreatePinnedToCore(
+    task_rxCAN,     /* Function to implement the task */
+    "task_rxCAN",   /* Name of the task */
+    4096,      /* Stack size in words */
+    NULL,      /* Task input parameter */
+    1,         /* Priority of the task */
+    NULL,      /* Task handle. */
+    1);        /* Core where the task should run */  
+
+  lastStatusReveiced = millis();
+}
+
+void loop() 
+{ 
+  if(PS4.isConnected()) {
+
+//    Serial.print("R_X: "); Serial.print(PS4.data.analog.stick.rx, DEC);
+//    Serial.print(" R_Y: "); Serial.print(PS4.data.analog.stick.ry, DEC);
+//    Serial.print(" L_X: "); Serial.print(PS4.data.analog.stick.lx, DEC);
+//    Serial.print(" L_Y: "); Serial.print(PS4.data.analog.stick.ly, DEC);
+//    Serial.println();
+
+//    Serial.print("DIS: "); Serial.println(distance);
+
+    display.setCursor(83,25);
+    display.print("PS4 OK ");
+
+    display.setCursor(5, 40);
+    if (auto_break) {
+      if (break_active) {
+        display.print("FRONT ASSIST ACTIVE");
+        PS4.setLed(255, 0, 0);
+      }
+      else {
+        display.print("FRONT ASSIST     ON ");
+        PS4.setLed(0, 255, 0);
+      }
+    }
+    else {
+      display.print("FRONT ASSIST     OFF");
+      PS4.setLed(0, 0, 255);
+    }
+
+    #ifdef TILT_RUMBLE
+    if (tilt_warn) {
+      PS4.setRumble(0, TILT_RUMBLE);
+    }
+    else {
+      PS4.setRumble(0, 0);
+    }
+    #endif
+    
+    PS4.sendToController();
+    delay(15);
+
+    display.setCursor(5, 55);
+    display.print("DISTANCE");
+    char sf[4];
+    sprintf(sf, "%4d", distance);
+    display.setCursor(95, 55);
+    display.print(sf);
+
+    // read analog sticks (integers)
+    int rgt_stick_x = PS4.data.analog.stick.rx; // -128 0 127
+    int rgt_stick_y = PS4.data.analog.stick.ry; // -128 0 127
+    int lft_stick_x = PS4.data.analog.stick.lx; // -128 0 127
+    int lft_stick_y = PS4.data.analog.stick.ly; // -128 0 127
+
+    // prepare analog sticks (bytes)
+    byte b_rgt_stick_x_val;
+    byte b_rgt_stick_x_dir;
+    if (rgt_stick_x >= 0) {
+      b_rgt_stick_x_val = byte(rgt_stick_x);
+      b_rgt_stick_x_dir = 1;
+    }
+    else {
+      b_rgt_stick_x_val = byte(abs(rgt_stick_x-1));
+      b_rgt_stick_x_dir = 0;
+    }
+
+    byte b_rgt_stick_y_val;
+    byte b_rgt_stick_y_dir;
+    if (rgt_stick_y >= 0) {
+      b_rgt_stick_y_val = byte(rgt_stick_y);
+      b_rgt_stick_y_dir = 1;
+    }
+    else {
+      b_rgt_stick_y_val = byte(abs(rgt_stick_y-1));
+      b_rgt_stick_y_dir = 0;
+    }
+
+    byte b_lft_stick_x_val;
+    byte b_lft_stick_x_dir;
+    if (lft_stick_x >= 0) {
+      b_lft_stick_x_val = byte(lft_stick_x);
+      b_lft_stick_x_dir = 1;
+    }
+    else {
+      b_lft_stick_x_val = byte(abs(lft_stick_x-1));
+      b_lft_stick_x_dir = 0;
+    }
+
+    byte b_lft_stick_y_val;
+    byte b_lft_stick_y_dir;
+    if (lft_stick_y >= 0) {
+      b_lft_stick_y_val = byte(lft_stick_y);
+      b_lft_stick_y_dir = 1;
+    }
+    else {
+      b_lft_stick_y_val = byte(abs(lft_stick_y-1));
+      b_lft_stick_y_dir = 0;
+    }
+    
+    CAN_frame_t tx_control;
+    
+    // Send analog sticks bytes on CAN
+    tx_control.FIR.B.FF==CAN_frame_std;
+    tx_control.MsgID = 0x10;
+    tx_control.FIR.B.DLC = 8;
+    tx_control.data.u8[0] = b_rgt_stick_x_val;
+    tx_control.data.u8[1] = b_rgt_stick_x_dir;
+    tx_control.data.u8[2] = b_rgt_stick_y_val;
+    tx_control.data.u8[3] = b_rgt_stick_y_dir;
+    tx_control.data.u8[4] = b_lft_stick_x_val;
+    tx_control.data.u8[5] = b_lft_stick_x_dir;
+    tx_control.data.u8[6] = b_lft_stick_y_val;
+    tx_control.data.u8[7] = b_lft_stick_y_dir;
+    
+    ESP32Can.CANWriteFrame(&tx_control);
+
+    delay(5);
+
+    // send button states as byte on CAN
+    tx_control.FIR.B.FF==CAN_frame_std;
+    tx_control.MsgID = 0x11;
+    tx_control.FIR.B.DLC = 8;
+    tx_control.data.u8[0] = byte(PS4.data.button.right);
+    tx_control.data.u8[1] = byte(PS4.data.button.left);
+    tx_control.data.u8[2] = byte(PS4.data.button.up);
+    tx_control.data.u8[3] = byte(PS4.data.button.down);
+    tx_control.data.u8[4] = byte(PS4.data.button.square);
+    tx_control.data.u8[5] = byte(PS4.data.button.circle);
+    tx_control.data.u8[6] = byte(PS4.data.button.triangle);
+    tx_control.data.u8[7] = byte(PS4.data.button.cross);
+    ESP32Can.CANWriteFrame(&tx_control);
+    
+    delay(5);
+    
+    // send button states as byte on CAN
+    tx_control.FIR.B.FF==CAN_frame_std;
+    tx_control.MsgID = 0x12;
+    tx_control.FIR.B.DLC = 8;
+    tx_control.data.u8[0] = byte(PS4.data.button.l1);
+    tx_control.data.u8[1] = byte(PS4.data.button.r1);
+    tx_control.data.u8[2] = 0;
+    tx_control.data.u8[3] = 0;
+    tx_control.data.u8[4] = 0;
+    tx_control.data.u8[5] = 0;
+    tx_control.data.u8[6] = 0;
+    tx_control.data.u8[7] = 0;
+    ESP32Can.CANWriteFrame(&tx_control);
+
+    // delay(5);
+  }
+  else {
+//    Serial.println("No PS4 controller connected.");
+    display.setCursor(83,25);
+    display.print("PS4 NOK");
+    display.setCursor(5, 40);
+    display.print("                    ");
+    display.display();
+    delay(1000);
+  }
+  if ((millis() - lastStatusReveiced) < STATUS_CAN_TIMEOUT) {
+    display.setCursor(5,25);
+    display.print("CAN OK ");
+  }
+  else {
+    auto_break = false;
+    break_active = false;
+    distance = 0;
+    tilt_warn = false;
+    display.setCursor(5,25);
+    display.print("CAN NOK");
+    display.setCursor(5, 40);
+    display.print("                    ");
+    display.setCursor(5, 55);
+    display.print("                    ");
+    delay(15); 
+  }
+  display.display();
+}
